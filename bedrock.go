@@ -105,8 +105,10 @@ func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
 
 	// Add required headers
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Content-Length", fmt.Sprintf("%d", len(jsonBody)))
 	httpReq.Header.Set("Accept", "application/json")
 	httpReq.Header.Set("X-Amzn-Bedrock-Invocation-Action", "InvokeModel")
+	httpReq.Header.Set("X-Amz-User-Agent", "aws-sdk-js/1.0.0 os/macOS/10.15.7 lang/js md/browser/Chrome_131.0.0.0 api/bedrock_runtime/1.0.0 Bedrock")
 
 	// Sign the request with AWS SigV4
 	if err := c.signRequest(httpReq); err != nil {

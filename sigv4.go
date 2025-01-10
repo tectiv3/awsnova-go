@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -18,7 +19,7 @@ const (
 	awsAlgorithm   = "AWS4-HMAC-SHA256"
 	awsService     = "bedrock"
 	awsRequestType = "aws4_request"
-	signedHeaders  = "content-type;host;x-amz-content-sha256;x-amz-date;x-amzn-bedrock-invocation-action"
+	signedHeaders  = "content-length;content-type;host;x-amz-content-sha256;x-amz-date;x-amzn-bedrock-invocation-action;x-amz-user-agent"
 )
 
 // signRequest signs an HTTP request with AWS SigV4
@@ -27,15 +28,17 @@ func (c *Client) signRequest(req *http.Request) error {
 	amzDate := now.Format("20060102T150405Z")
 	dateStamp := now.Format("20060102")
 
-	// Add basic required headers
-	req.Header.Set("X-Amz-Date", amzDate)
-	if c.credentials.SessionToken != "" {
-		req.Header.Set("X-Amz-Security-Token", c.credentials.SessionToken)
+	// Ensure host is set
+	if req.Host == "" {
+		req.Host = req.URL.Host
 	}
 
 	// Calculate payload hash
 	payloadHash := c.hashPayload(req)
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+
+	// Add required headers
+	req.Header.Set("X-Amz-Date", amzDate)
 
 	// Task 1: Create canonical request
 	canonicalRequest := c.createCanonicalRequest(req, payloadHash)
@@ -54,22 +57,25 @@ func (c *Client) signRequest(req *http.Request) error {
 		awsAlgorithm, credential, signedHeaders, signature)
 
 	req.Header.Set("Authorization", authHeader)
+	log.Printf("Authorization header: %s", authHeader)
 
 	return nil
 }
 
 func (c *Client) hashPayload(req *http.Request) string {
 	if req.Body == nil {
+		log.Println("Request body is nil")
 		return c.hashHex([]byte{})
 	}
 
 	body, _ := req.GetBody()
 	if body == nil {
+		log.Println("Failed to get request body")
 		return c.hashHex([]byte{})
 	}
+	defer body.Close()
 
-	payload, _ := req.GetBody()
-	data, _ := io.ReadAll(payload)
+	data, _ := io.ReadAll(body)
 	req.Body = io.NopCloser(bytes.NewReader(data))
 
 	return c.hashHex(data)
@@ -104,8 +110,9 @@ func (c *Client) calculateSignature(stringToSign, dateStamp string) string {
 	kRegion := c.hmacSHA256(kDate, []byte(c.region))
 	kService := c.hmacSHA256(kRegion, []byte(awsService))
 	kSigning := c.hmacSHA256(kService, []byte(awsRequestType))
+	signature := c.hmacSHA256(kSigning, []byte(stringToSign))
 
-	return hex.EncodeToString(c.hmacSHA256(kSigning, []byte(stringToSign)))
+	return hex.EncodeToString(signature)
 }
 
 func (c *Client) getCanonicalURI(u *url.URL) string {
@@ -144,11 +151,13 @@ func (c *Client) getCanonicalQueryString(u *url.URL) string {
 
 func (c *Client) getCanonicalHeaders(req *http.Request) string {
 	headers := map[string][]string{
+		"content-length":                   {req.Header.Get("Content-Length")},
 		"content-type":                     {req.Header.Get("Content-Type")},
 		"host":                             {req.Host},
 		"x-amz-content-sha256":             {req.Header.Get("X-Amz-Content-Sha256")},
 		"x-amz-date":                       {req.Header.Get("X-Amz-Date")},
 		"x-amzn-bedrock-invocation-action": {req.Header.Get("X-Amzn-Bedrock-Invocation-Action")},
+		"x-amz-user-agent":                 {req.Header.Get("X-Amz-User-Agent")},
 	}
 
 	if token := req.Header.Get("X-Amz-Security-Token"); token != "" {
