@@ -51,31 +51,34 @@ type Request struct {
 
 // Response represents the model's output
 type Response struct {
-	Output struct {
+	Output *struct {
 		Message struct {
 			Content []struct {
 				Text string `json:"text"`
 			} `json:"content"`
 		} `json:"message"`
-	} `json:"output"`
+	} `json:"output,omitempty"`
 	Type  string `json:"__type"`
-	Usage struct {
+	Usage *struct {
 		InputTokens  int `json:"inputTokens"`
 		OutputTokens int `json:"outputTokens"`
-	} `json:"usage"`
+	} `json:"usage,omitempty"`
 	Error string `json:"error"`
 }
 
 // Invoke sends a request to the Claude model and returns its response
 func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
 	// Construct the API endpoint URL
-	url := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke", c.region, c.modelID)
+	url := "https://bedrock-runtime.us-west-2.amazonaws.com/model/arn%3Aaws%3Abedrock%3Aus-west-2%3A081854276596%3Ainference-profile%2Fus.amazon.nova-pro-v1%3A0/invoke"
 
 	// Prepare the request body
 	body := map[string]interface{}{
 		"schemaVersion": "messages-v1",
 		"inferenceConfig": map[string]interface{}{
 			"max_new_tokens": req.MaxTokens,
+			"temperature":    req.Temperature,
+			"top_p":          req.TopP,
+			"top_k":          req.TopK,
 		},
 		"messages": []map[string]interface{}{
 			{
@@ -130,9 +133,7 @@ func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
 
 	// Check for non-200 status code
 	if resp.StatusCode != http.StatusOK {
-		return &Response{
-			Error: fmt.Sprintf("API error: %s - %s", resp.Status, string(respBody)),
-		}, nil
+		return nil, fmt.Errorf("%s", string(respBody))
 	}
 	log.Printf("Response body: %s", string(respBody))
 	// Parse response
@@ -156,21 +157,21 @@ func LoadCredentials(filepath string) (AWSCredentials, error) {
 	// Skip header if exists
 	reader.FieldsPerRecord = -1
 
-	first, err := reader.Read()
+	// Read all records from the CSV file
+	records, err := reader.ReadAll()
 	if err != nil {
 		return AWSCredentials{}, err
 	}
-
-	// If first row looks like a header, read next row
-	if first[0] == "Access key ID" || first[0] == "AccessKeyId" {
-		first, err = reader.Read()
-		if err != nil {
-			return AWSCredentials{}, err
-		}
+	if len(records) == 0 {
+		return AWSCredentials{}, fmt.Errorf("no records found in %s", filepath)
+	}
+	// Skip the header row if it exists
+	if len(records) > 1 {
+		records = records[1:]
 	}
 
 	return AWSCredentials{
-		AccessKeyID:     first[0],
-		SecretAccessKey: first[1],
+		AccessKeyID:     records[0][0],
+		SecretAccessKey: records[0][1],
 	}, nil
 }

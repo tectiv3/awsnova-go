@@ -25,7 +25,7 @@ func main() {
 		TopK:        40,
 	})
 	if err != nil {
-		log.Fatalf("failed to invoke model: %v", err)
+		log.Fatal(err)
 	}
 	log.Printf("response: %+v", r)
 }
