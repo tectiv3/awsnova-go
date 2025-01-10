@@ -1,4 +1,4 @@
-package bedrock-go
+package bedrock
 
 import (
 	"bytes"
@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -14,10 +15,10 @@ import (
 )
 
 const (
-	awsAlgorithm    = "AWS4-HMAC-SHA256"
-	awsService      = "bedrock"
-	awsRequestType  = "aws4_request"
-	signedHeaders   = "content-type;host;x-amz-content-sha256;x-amz-date"
+	awsAlgorithm   = "AWS4-HMAC-SHA256"
+	awsService     = "bedrock"
+	awsRequestType = "aws4_request"
+	signedHeaders  = "content-type;host;x-amz-content-sha256;x-amz-date;x-amzn-bedrock-invocation-action"
 )
 
 // signRequest signs an HTTP request with AWS SigV4
@@ -33,17 +34,17 @@ func (c *Client) signRequest(req *http.Request) error {
 	}
 
 	// Calculate payload hash
-	payloadHash := hashPayload(req)
+	payloadHash := c.hashPayload(req)
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
 	// Task 1: Create canonical request
-	canonicalRequest := createCanonicalRequest(req, payloadHash)
+	canonicalRequest := c.createCanonicalRequest(req, payloadHash)
 
 	// Task 2: Create string to sign
-	stringToSign := createStringToSign(canonicalRequest, amzDate, dateStamp, c.region)
+	stringToSign := c.createStringToSign(canonicalRequest, amzDate, dateStamp)
 
 	// Task 3: Calculate signature
-	signature := calculateSignature(stringToSign, dateStamp, c.region, c.credentials.SecretAccessKey)
+	signature := c.calculateSignature(stringToSign, dateStamp)
 
 	// Task 4: Add signature to header
 	credential := fmt.Sprintf("%s/%s/%s/%s/%s",
@@ -53,29 +54,31 @@ func (c *Client) signRequest(req *http.Request) error {
 		awsAlgorithm, credential, signedHeaders, signature)
 
 	req.Header.Set("Authorization", authHeader)
+
 	return nil
 }
 
-func hashPayload(req *http.Request) string {
+func (c *Client) hashPayload(req *http.Request) string {
 	if req.Body == nil {
-		return hashHex([]byte{})
+		return c.hashHex([]byte{})
 	}
 
 	body, _ := req.GetBody()
 	if body == nil {
-		return hashHex([]byte{})
+		return c.hashHex([]byte{})
 	}
 
 	payload, _ := req.GetBody()
-	data, _ := bytes.ReadAll(payload)
-	req.Body = bytes.NewReader(data)
-	return hashHex(data)
+	data, _ := io.ReadAll(payload)
+	req.Body = io.NopCloser(bytes.NewReader(data))
+
+	return c.hashHex(data)
 }
 
-func createCanonicalRequest(req *http.Request, payloadHash string) string {
-	canonicalURI := getCanonicalURI(req.URL)
-	canonicalQueryString := getCanonicalQueryString(req.URL)
-	canonicalHeaders := getCanonicalHeaders(req)
+func (c *Client) createCanonicalRequest(req *http.Request, payloadHash string) string {
+	canonicalURI := c.getCanonicalURI(req.URL)
+	canonicalQueryString := c.getCanonicalQueryString(req.URL)
+	canonicalHeaders := c.getCanonicalHeaders(req)
 
 	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
 		req.Method,
@@ -86,32 +89,35 @@ func createCanonicalRequest(req *http.Request, payloadHash string) string {
 		payloadHash)
 }
 
-func createStringToSign(canonicalRequest, amzDate, dateStamp, region string) string {
-	scope := fmt.Sprintf("%s/%s/%s/%s", dateStamp, region, awsService, awsRequestType)
+func (c *Client) createStringToSign(canonicalRequest, amzDate, dateStamp string) string {
+	scope := fmt.Sprintf("%s/%s/%s/%s", dateStamp, c.region, awsService, awsRequestType)
+
 	return fmt.Sprintf("%s\n%s\n%s\n%s",
 		awsAlgorithm,
 		amzDate,
 		scope,
-		hashHex([]byte(canonicalRequest)))
+		c.hashHex([]byte(canonicalRequest)))
 }
 
-func calculateSignature(stringToSign, dateStamp, region, secretKey string) string {
-	kDate := hmacSHA256([]byte("AWS4"+secretKey), []byte(dateStamp))
-	kRegion := hmacSHA256(kDate, []byte(region))
-	kService := hmacSHA256(kRegion, []byte(awsService))
-	kSigning := hmacSHA256(kService, []byte(awsRequestType))
-	return hex.EncodeToString(hmacSHA256(kSigning, []byte(stringToSign)))
+func (c *Client) calculateSignature(stringToSign, dateStamp string) string {
+	kDate := c.hmacSHA256([]byte("AWS4"+c.credentials.SecretAccessKey), []byte(dateStamp))
+	kRegion := c.hmacSHA256(kDate, []byte(c.region))
+	kService := c.hmacSHA256(kRegion, []byte(awsService))
+	kSigning := c.hmacSHA256(kService, []byte(awsRequestType))
+
+	return hex.EncodeToString(c.hmacSHA256(kSigning, []byte(stringToSign)))
 }
 
-func getCanonicalURI(u *url.URL) string {
+func (c *Client) getCanonicalURI(u *url.URL) string {
 	uri := u.EscapedPath()
 	if uri == "" {
 		return "/"
 	}
+
 	return uri
 }
 
-func getCanonicalQueryString(u *url.URL) string {
+func (c *Client) getCanonicalQueryString(u *url.URL) string {
 	params := u.Query()
 	if len(params) == 0 {
 		return ""
@@ -132,15 +138,17 @@ func getCanonicalQueryString(u *url.URL) string {
 				url.QueryEscape(k), url.QueryEscape(v)))
 		}
 	}
+
 	return strings.Join(pairs, "&")
 }
 
-func getCanonicalHeaders(req *http.Request) string {
+func (c *Client) getCanonicalHeaders(req *http.Request) string {
 	headers := map[string][]string{
-		"content-type":           {req.Header.Get("Content-Type")},
-		"host":                   {req.Host},
-		"x-amz-content-sha256":  {req.Header.Get("X-Amz-Content-Sha256")},
-		"x-amz-date":            {req.Header.Get("X-Amz-Date")},
+		"content-type":                     {req.Header.Get("Content-Type")},
+		"host":                             {req.Host},
+		"x-amz-content-sha256":             {req.Header.Get("X-Amz-Content-Sha256")},
+		"x-amz-date":                       {req.Header.Get("X-Amz-Date")},
+		"x-amzn-bedrock-invocation-action": {req.Header.Get("X-Amzn-Bedrock-Invocation-Action")},
 	}
 
 	if token := req.Header.Get("X-Amz-Security-Token"); token != "" {
@@ -162,16 +170,19 @@ func getCanonicalHeaders(req *http.Request) string {
 		canonicalHeaders.WriteString(strings.Join(values, ","))
 		canonicalHeaders.WriteString("\n")
 	}
+
 	return canonicalHeaders.String()
 }
 
-func hashHex(data []byte) string {
+func (c *Client) hashHex(data []byte) string {
 	hash := sha256.Sum256(data)
+
 	return hex.EncodeToString(hash[:])
 }
 
-func hmacSHA256(key, data []byte) []byte {
+func (c *Client) hmacSHA256(key, data []byte) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write(data)
+
 	return mac.Sum(nil)
 }
