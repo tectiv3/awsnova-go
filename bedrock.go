@@ -3,14 +3,19 @@ package bedrock
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
+
+	sigv4 "github.com/imacks/aws-sigv4"
 )
 
 // Client represents an Amazon Bedrock client for the Anthropic Claude model
@@ -69,7 +74,9 @@ type Response struct {
 // Invoke sends a request to the Claude model and returns its response
 func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
 	// Construct the API endpoint URL
-	url := "https://bedrock-runtime.us-west-2.amazonaws.com/model/arn%3Aaws%3Abedrock%3Aus-west-2%3A081854276596%3Ainference-profile%2Fus.amazon.nova-pro-v1%3A0/invoke"
+	url := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke",
+		c.region,
+		url.QueryEscape(c.modelID))
 
 	// Prepare the request body
 	body := map[string]interface{}{
@@ -94,57 +101,70 @@ func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
-	log.Printf("Request body: %s", jsonBody)
-
-	// Create HTTP request with a seekable body
-	bodyReader := bytes.NewReader(jsonBody)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bodyReader)
+	bodyBytes := bytes.NewReader(jsonBody)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bodyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Add required headers
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Content-Length", fmt.Sprintf("%d", len(jsonBody)))
-	httpReq.Header.Set("Accept", "application/json")
-	httpReq.Header.Set("X-Amzn-Bedrock-Invocation-Action", "InvokeModel")
-	httpReq.Header.Set("X-Amz-User-Agent", "aws-sdk-js/1.0.0 os/macOS/10.15.7 lang/js md/browser/Chrome_131.0.0.0 api/bedrock_runtime/1.0.0 Bedrock")
-
-	// Sign the request with AWS SigV4
-	if err := c.signRequest(httpReq); err != nil {
-		return nil, fmt.Errorf("failed to sign request: %w", err)
+	signer, err := sigv4.New(
+		sigv4.WithCredential(c.credentials.AccessKeyID, c.credentials.SecretAccessKey, ""),
+		sigv4.WithRegionService("us-west-2", "bedrock"))
+	if err != nil {
+		panic(err)
 	}
 
-	// Reset the body reader after signing
-	if _, err := bodyReader.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to reset request body: %w", err)
+	err = signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now()))
+	if err != nil {
+		panic(err)
 	}
 
-	// Send the request
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read response body
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Check for non-200 status code
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s", string(respBody))
 	}
 	log.Printf("Response body: %s", string(respBody))
-	// Parse response
+
 	var result Response
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	return &result, nil
+}
+
+func (c *Client) hashPayload(req *http.Request) string {
+	if req.Body == nil {
+		log.Println("Request body is nil")
+		return c.hashHex([]byte{})
+	}
+
+	body, _ := req.GetBody()
+	if body == nil {
+		log.Println("Failed to get request body")
+		return c.hashHex([]byte{})
+	}
+	defer body.Close()
+
+	data, _ := io.ReadAll(body)
+
+	return c.hashHex(data)
+}
+
+func (c *Client) hashHex(data []byte) string {
+	hash := sha256.Sum256(data)
+
+	return hex.EncodeToString(hash[:])
 }
 
 // LoadCredentials loads AWS credentials from a CSV file
