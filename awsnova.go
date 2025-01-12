@@ -45,13 +45,17 @@ func NewClient(region, modelID string, creds AWSCredentials) *Client {
 	}
 }
 
+type InferenceConfig struct {
+	MaxTokens   *int     `json:"max_new_tokens,omitempty"`
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP        *float64 `json:"top_p,omitempty"`
+	TopK        *int     `json:"top_k,omitempty"`
+}
+
 // Request represents the input for a model invocation
 type Request struct {
-	Prompt      string
-	MaxTokens   int
-	Temperature float64
-	TopP        float64
-	TopK        int
+	Prompt          string
+	InferenceConfig `json:",inline"`
 }
 
 // Response represents the model's output
@@ -71,22 +75,15 @@ type Response struct {
 	Error string `json:"error"`
 }
 
-// Invoke sends a request to the Claude model and returns its response
-func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
-	// Construct the API endpoint URL
-	url := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke",
-		c.region,
-		url.QueryEscape(c.modelID))
+func (c *Client) buildRequestURL() string {
+	return fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke",
+		c.region, url.QueryEscape(c.modelID))
+}
 
-	// Prepare the request body
+func (c *Client) buildRequestBody(req Request) ([]byte, error) {
 	body := map[string]interface{}{
-		"schemaVersion": "messages-v1",
-		"inferenceConfig": map[string]interface{}{
-			"max_new_tokens": req.MaxTokens,
-			"temperature":    req.Temperature,
-			"top_p":          req.TopP,
-			"top_k":          req.TopK,
-		},
+		"schemaVersion":   "messages-v1",
+		"inferenceConfig": req.InferenceConfig,
 		"messages": []map[string]interface{}{
 			{
 				"role": "user",
@@ -96,29 +93,10 @@ func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
 			},
 		},
 	}
+	return json.Marshal(body)
+}
 
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-	bodyBytes := bytes.NewReader(jsonBody)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bodyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	signer, err := sigv4.New(
-		sigv4.WithCredential(c.credentials.AccessKeyID, c.credentials.SecretAccessKey, ""),
-		sigv4.WithRegionService("us-west-2", "bedrock"))
-	if err != nil {
-		panic(err)
-	}
-
-	err = signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now()))
-	if err != nil {
-		panic(err)
-	}
-
+func (c *Client) sendRequest(ctx context.Context, httpReq *http.Request) (*Response, error) {
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
@@ -133,7 +111,6 @@ func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s", string(respBody))
 	}
-	log.Printf("Response body: %s", string(respBody))
 
 	var result Response
 	if err := json.Unmarshal(respBody, &result); err != nil {
@@ -141,6 +118,51 @@ func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
 	}
 
 	return &result, nil
+}
+
+// Invoke sends a request to the model and returns its response
+func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
+	jsonBody, err := c.buildRequestBody(req)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.buildRequestURL(), bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	signer, err := sigv4.New(
+		sigv4.WithCredential(c.credentials.AccessKeyID, c.credentials.SecretAccessKey, ""),
+		sigv4.WithRegionService("us-west-2", "bedrock"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signer: %w", err)
+	}
+
+	if err := signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now())); err != nil {
+		return nil, fmt.Errorf("failed to sign request: %w", err)
+	}
+
+	return c.sendRequest(ctx, httpReq)
+}
+
+func (c *Client) InvokeAsync(ctx context.Context, req Request) <-chan *Response {
+	respChan := make(chan *Response, 1)
+
+	go func() {
+		defer close(respChan)
+
+		resp, err := c.Invoke(ctx, req)
+		if err != nil {
+			log.Printf("Error in async invocation: %v", err)
+			return
+		}
+
+		respChan <- resp
+	}()
+
+	return respChan
 }
 
 func (c *Client) hashPayload(req *http.Request) string {

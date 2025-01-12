@@ -17,15 +17,19 @@ func main() {
 
 	c := awsnova.NewClient("us-west-2", "arn:aws:bedrock:us-west-2:081854276596:inference-profile/us.amazon.nova-pro-v1:0", creds)
 
+	maxTokens := 1000
 	r, err := c.Invoke(context.Background(), awsnova.Request{
-		Prompt:      "How are you?",
-		MaxTokens:   100,
-		Temperature: 0.7,
-		TopP:        0.9,
-		TopK:        40,
+		Prompt: "How are you?",
+		InferenceConfig: awsnova.InferenceConfig{
+			MaxTokens: &maxTokens,
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("response: %+v", r)
+	if r.Output != nil {
+		log.Printf("response: %+v", r.Output.Message)
+	} else {
+		log.Printf("response: %+v", r)
+	}
 }
