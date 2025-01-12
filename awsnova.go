@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -16,22 +17,11 @@ import (
 	"time"
 
 	sigv4 "github.com/imacks/aws-sigv4"
+	"github.com/tectiv3/awsnova-go/eventstream"
+	// "github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
 )
 
-// Client represents an Amazon Bedrock client for the Anthropic Claude model
-type Client struct {
-	httpClient  *http.Client
-	region      string
-	modelID     string
-	credentials AWSCredentials
-}
-
-// AWSCredentials holds AWS authentication details
-type AWSCredentials struct {
-	AccessKeyID     string
-	SecretAccessKey string
-	SessionToken    string // Optional
-}
+const maxPayloadLen = 1024 * 1024 * 16 // 16MB
 
 // NewClient creates a new Bedrock client
 func NewClient(region, modelID string, creds AWSCredentials) *Client {
@@ -45,39 +35,37 @@ func NewClient(region, modelID string, creds AWSCredentials) *Client {
 	}
 }
 
-type InferenceConfig struct {
-	MaxTokens   *int     `json:"max_new_tokens,omitempty"`
-	Temperature *float64 `json:"temperature,omitempty"`
-	TopP        *float64 `json:"top_p,omitempty"`
-	TopK        *int     `json:"top_k,omitempty"`
-}
+// Invoke sends a request to the Claude model and returns its response
+func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
+	jsonBody, err := c.buildRequestBody(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
 
-// Request represents the input for a model invocation
-type Request struct {
-	Prompt          string
-	InferenceConfig `json:",inline"`
-}
+	httpReq, err := http.NewRequestWithContext(ctx,
+		"POST",
+		fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke",
+			c.region,
+			url.QueryEscape(c.modelID),
+		),
+		bytes.NewReader(jsonBody),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
 
-// Response represents the model's output
-type Response struct {
-	Output *struct {
-		Message struct {
-			Content []struct {
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"message"`
-	} `json:"output,omitempty"`
-	Type  string `json:"__type"`
-	Usage *struct {
-		InputTokens  int `json:"inputTokens"`
-		OutputTokens int `json:"outputTokens"`
-	} `json:"usage,omitempty"`
-	Error string `json:"error"`
-}
+	signer, err := sigv4.New(
+		sigv4.WithCredential(c.credentials.AccessKeyID, c.credentials.SecretAccessKey, ""),
+		sigv4.WithRegionService("us-west-2", "bedrock"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signer: %w", err)
+	}
 
-func (c *Client) buildRequestURL() string {
-	return fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke",
-		c.region, url.QueryEscape(c.modelID))
+	if err := signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now())); err != nil {
+		return nil, fmt.Errorf("failed to sign request: %w", err)
+	}
+
+	return c.sendRequest(ctx, httpReq)
 }
 
 func (c *Client) buildRequestBody(req Request) ([]byte, error) {
@@ -120,33 +108,7 @@ func (c *Client) sendRequest(ctx context.Context, httpReq *http.Request) (*Respo
 	return &result, nil
 }
 
-// Invoke sends a request to the model and returns its response
-func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
-	jsonBody, err := c.buildRequestBody(req)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.buildRequestURL(), bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	signer, err := sigv4.New(
-		sigv4.WithCredential(c.credentials.AccessKeyID, c.credentials.SecretAccessKey, ""),
-		sigv4.WithRegionService("us-west-2", "bedrock"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create signer: %w", err)
-	}
-
-	if err := signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now())); err != nil {
-		return nil, fmt.Errorf("failed to sign request: %w", err)
-	}
-
-	return c.sendRequest(ctx, httpReq)
-}
-
+// InvokeAsync calls Invoke method in a goroutine and returns a channel to receive the response
 func (c *Client) InvokeAsync(ctx context.Context, req Request) <-chan *Response {
 	respChan := make(chan *Response, 1)
 
@@ -163,6 +125,116 @@ func (c *Client) InvokeAsync(ctx context.Context, req Request) <-chan *Response 
 	}()
 
 	return respChan
+}
+
+// InvokeModelWithResponseStream sends a request to the Claude model and streams the response to a channel
+func (c *Client) InvokeModelWithResponseStream(ctx context.Context, req Request) (<-chan *StreamResponse, error) {
+	respChan := make(chan *StreamResponse)
+
+	// Setup request as before...
+	jsonBody, err := c.buildRequestBody(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx,
+		"POST",
+		fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke-with-response-stream",
+			c.region, url.QueryEscape(c.modelID)),
+		bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Accept", "application/vnd.amazon.eventstream")
+
+	// Sign request as before...
+	signer, err := sigv4.New(
+		sigv4.WithCredential(c.credentials.AccessKeyID, c.credentials.SecretAccessKey, ""),
+		sigv4.WithRegionService("us-west-2", "bedrock"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signer: %w", err)
+	}
+
+	if err := signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now())); err != nil {
+		return nil, fmt.Errorf("failed to sign request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	// Start processing stream
+	go func() {
+		defer close(respChan)
+		defer resp.Body.Close()
+
+		decoder := eventstream.NewDecoder()
+		payloadBuf := make([]byte, maxPayloadLen)
+
+		for {
+			message, err := decoder.Decode(resp.Body, payloadBuf)
+			if err != nil {
+				if err != io.EOF {
+					respChan <- &StreamResponse{Error: err.Error()}
+				}
+				return
+			}
+
+			// Parse the JSON payload
+			var payloadMap map[string]interface{}
+			if err := json.Unmarshal(message.Payload, &payloadMap); err != nil {
+				continue
+			}
+
+			// Extract and decode the base64 bytes field
+			if bytesStr, ok := payloadMap["bytes"].(string); ok {
+				content, err := base64.StdEncoding.DecodeString(bytesStr)
+				if err != nil {
+					continue
+				}
+
+				var msgContent MessageContent
+				if err := json.Unmarshal(content, &msgContent); err != nil {
+					continue
+				}
+
+				// Handle different message types
+				switch {
+				case msgContent.MessageStart != nil:
+					respChan <- &StreamResponse{
+						Role: msgContent.MessageStart.Role,
+					}
+				case msgContent.ContentBlockDelta != nil:
+					respChan <- &StreamResponse{
+						Content: msgContent.ContentBlockDelta.Delta.Text,
+						Index:   msgContent.ContentBlockDelta.ContentBlockIndex,
+					}
+				case msgContent.ContentBlockStop != nil:
+					respChan <- &StreamResponse{
+						Index: msgContent.ContentBlockStop.ContentBlockIndex,
+						Done:  true,
+					}
+				case msgContent.MessageStop != nil:
+					// Handle message stop if needed
+					continue
+				case msgContent.Metadata != nil:
+					respChan <- &StreamResponse{
+						Usage: &struct {
+							InputTokens  int
+							OutputTokens int
+						}{
+							InputTokens:  msgContent.Metadata.Usage.InputTokens,
+							OutputTokens: msgContent.Metadata.Usage.OutputTokens,
+						},
+					}
+				}
+			}
+		}
+	}()
+
+	return respChan, nil
 }
 
 func (c *Client) hashPayload(req *http.Request) string {
