@@ -1,4 +1,4 @@
-package bedrock
+package awsnova
 
 import (
 	"bytes"

@@ -1,4 +1,4 @@
-module github.com/tectiv3/bedrock-go
+module github.com/tectiv3/awsnova-go
 
 go 1.23.3
 
