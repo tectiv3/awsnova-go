@@ -61,7 +61,7 @@ func (c *Client) Invoke(ctx context.Context, req Request) (*Response, error) {
 		return nil, fmt.Errorf("failed to create signer: %w", err)
 	}
 
-	if err := signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now())); err != nil {
+	if err := signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now().UTC())); err != nil {
 		return nil, fmt.Errorf("failed to sign request: %w", err)
 	}
 
@@ -154,7 +154,7 @@ func (c *Client) InvokeModelWithResponseStream(ctx context.Context, req Request)
 		return nil, fmt.Errorf("failed to create signer: %w", err)
 	}
 
-	if err := signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now())); err != nil {
+	if err := signer.Sign(httpReq, c.hashPayload(httpReq), sigv4.NewTime(time.Now().UTC())); err != nil {
 		return nil, fmt.Errorf("failed to sign request: %w", err)
 	}
 
@@ -168,71 +168,82 @@ func (c *Client) InvokeModelWithResponseStream(ctx context.Context, req Request)
 		defer resp.Body.Close()
 
 		decoder := eventstream.NewDecoder()
-		payloadBuf := make([]byte, maxPayloadLen)
 
 		for {
-			message, err := decoder.Decode(resp.Body, payloadBuf)
-			if err != nil {
-				if err == io.EOF {
-					// Only return on EOF if we've received completion metadata
-					select {
-					case <-ctx.Done():
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				payloadBuf := make([]byte, maxPayloadLen)
+				message, err := decoder.Decode(resp.Body, payloadBuf)
+				if err != nil {
+					if err == io.EOF {
 						return
-					default:
+					}
+					log.Printf("Error decoding message: %v", err)
+					respChan <- &StreamResponse{Error: err.Error()}
+					return
+				}
+				log.Println("Message: ", string(message.Payload))
+				// Parse the JSON payload
+				var payloadMap map[string]interface{}
+				if err := json.Unmarshal(message.Payload, &payloadMap); err != nil {
+					log.Printf("Error unmarshalling payload: %v", err)
+					continue
+				}
+
+				// Extract and decode the base64 bytes field
+				if messageStr, ok := payloadMap["message"].(string); ok {
+					respChan <- &StreamResponse{
+						Error: messageStr,
+						Done:  true,
+					}
+					return
+				}
+
+				if bytesStr, ok := payloadMap["bytes"].(string); ok {
+					content, err := base64.StdEncoding.DecodeString(bytesStr)
+					if err != nil {
+						log.Printf("Error decoding base64 bytes: %v", err)
 						continue
 					}
-				}
-				respChan <- &StreamResponse{Error: err.Error()}
-				return
-			}
 
-			// Parse the JSON payload
-			var payloadMap map[string]interface{}
-			if err := json.Unmarshal(message.Payload, &payloadMap); err != nil {
-				continue
-			}
+					var msgContent MessageContent
+					if err := json.Unmarshal(content, &msgContent); err != nil {
+						log.Printf("Error unmarshalling message content: %v", err)
+						continue
+					}
 
-			// Extract and decode the base64 bytes field
-			if bytesStr, ok := payloadMap["bytes"].(string); ok {
-				content, err := base64.StdEncoding.DecodeString(bytesStr)
-				if err != nil {
-					continue
-				}
-
-				var msgContent MessageContent
-				if err := json.Unmarshal(content, &msgContent); err != nil {
-					continue
-				}
-
-				// Handle different message types
-				switch {
-				case msgContent.MessageStart != nil:
-					respChan <- &StreamResponse{
-						Role: msgContent.MessageStart.Role,
-					}
-				case msgContent.ContentBlockDelta != nil:
-					respChan <- &StreamResponse{
-						Content: msgContent.ContentBlockDelta.Delta.Text,
-						Index:   msgContent.ContentBlockDelta.ContentBlockIndex,
-					}
-				case msgContent.ContentBlockStop != nil:
-					respChan <- &StreamResponse{
-						Index: msgContent.ContentBlockStop.ContentBlockIndex,
-						Done:  false,
-					}
-				case msgContent.MessageStop != nil:
-					respChan <- &StreamResponse{
-						Done: true,
-					}
-				case msgContent.Metadata != nil:
-					respChan <- &StreamResponse{
-						Usage: &struct {
-							InputTokens  int
-							OutputTokens int
-						}{
-							InputTokens:  msgContent.Metadata.Usage.InputTokens,
-							OutputTokens: msgContent.Metadata.Usage.OutputTokens,
-						},
+					// Handle different message types
+					switch {
+					case msgContent.MessageStart != nil:
+						respChan <- &StreamResponse{
+							Role: msgContent.MessageStart.Role,
+						}
+					case msgContent.ContentBlockDelta != nil:
+						respChan <- &StreamResponse{
+							Content: msgContent.ContentBlockDelta.Delta.Text,
+							Index:   msgContent.ContentBlockDelta.ContentBlockIndex,
+						}
+					case msgContent.ContentBlockStop != nil:
+						respChan <- &StreamResponse{
+							Index: msgContent.ContentBlockStop.ContentBlockIndex,
+							Done:  false,
+						}
+					case msgContent.MessageStop != nil:
+						respChan <- &StreamResponse{
+							Done: true,
+						}
+					case msgContent.Metadata != nil:
+						respChan <- &StreamResponse{
+							Usage: &struct {
+								InputTokens  int
+								OutputTokens int
+							}{
+								InputTokens:  msgContent.Metadata.Usage.InputTokens,
+								OutputTokens: msgContent.Metadata.Usage.OutputTokens,
+							},
+						}
 					}
 				}
 			}
