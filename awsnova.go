@@ -129,7 +129,7 @@ func (c *Client) InvokeAsync(ctx context.Context, req Request) <-chan *Response 
 
 // InvokeModelWithResponseStream sends a request to the Claude model and streams the response to a channel
 func (c *Client) InvokeModelWithResponseStream(ctx context.Context, req Request) (<-chan *StreamResponse, error) {
-	respChan := make(chan *StreamResponse)
+	respChan := make(chan *StreamResponse, 1)
 
 	// Setup request as before...
 	jsonBody, err := c.buildRequestBody(req)
@@ -176,9 +176,16 @@ func (c *Client) InvokeModelWithResponseStream(ctx context.Context, req Request)
 		for {
 			message, err := decoder.Decode(resp.Body, payloadBuf)
 			if err != nil {
-				if err != io.EOF {
-					respChan <- &StreamResponse{Error: err.Error()}
+				if err == io.EOF {
+					// Only return on EOF if we've received completion metadata
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						continue
+					}
 				}
+				respChan <- &StreamResponse{Error: err.Error()}
 				return
 			}
 
@@ -214,11 +221,12 @@ func (c *Client) InvokeModelWithResponseStream(ctx context.Context, req Request)
 				case msgContent.ContentBlockStop != nil:
 					respChan <- &StreamResponse{
 						Index: msgContent.ContentBlockStop.ContentBlockIndex,
-						Done:  true,
+						Done:  false,
 					}
 				case msgContent.MessageStop != nil:
-					// Handle message stop if needed
-					continue
+					respChan <- &StreamResponse{
+						Done: true,
+					}
 				case msgContent.Metadata != nil:
 					respChan <- &StreamResponse{
 						Usage: &struct {

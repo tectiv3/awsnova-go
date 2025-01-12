@@ -49,32 +49,39 @@ func main() {
 	defer cancel()
 
 	// Invoke the model with response stream
-	respChan, err := c.InvokeModelWithResponseStream(ctx, req)
+	ch, err := c.InvokeModelWithResponseStream(ctx, req)
 	if err != nil {
 		log.Fatalf("Failed to invoke model: %v", err)
 	}
 
-	done := false
-	for resp := range respChan {
-		if resp.Error != "" {
-			log.Printf("Error: %s", resp.Error)
-			continue
-		}
-		if resp.Content != "" {
-			fmt.Print(resp.Content)
-		}
-		if resp.Done {
-			done = true
-			continue
-		}
-		if resp.Usage != nil {
-			log.Printf("Input tokens: %d, Output tokens: %d", resp.Usage.InputTokens, resp.Usage.OutputTokens)
-			break
+	for {
+		select {
+		case comp, ok := <-ch:
+			if !ok {
+				// channel closed
+				return
+			}
+
+			if comp.Error != "" {
+				log.Printf("Error: %s", comp.Error)
+				return
+			}
+			if comp.Content != "" {
+				fmt.Print(comp.Content)
+			}
+			if comp.Done {
+				fmt.Println()
+				log.Println("Done")
+				return
+			}
+			if comp.Usage != nil {
+				log.Printf("Input tokens: %d, Output tokens: %d", comp.Usage.InputTokens, comp.Usage.OutputTokens)
+				break
+			}
+		case <-ctx.Done():
+			log.Println("Timeout")
+			return
 		}
 	}
-	if done {
-		log.Println("Response stream ended")
-	} else {
-		<-ctx.Done()
-	}
+
 }
