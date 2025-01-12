@@ -20,16 +20,34 @@ func main() {
 	c := awsnova.NewClient("us-west-2", "arn:aws:bedrock:us-west-2:081854276596:inference-profile/us.amazon.nova-pro-v1:0", creds)
 
 	maxTokens := 1000
+	temperature := 0.9
 	prompt := "What is the capital of France?"
+	prev := "Paris."
+	fr := "What can you tell me about it?"
 	req := awsnova.Request{
-		Messages: []awsnova.Message{{
-			Role: "user",
-			Content: []awsnova.Content{
-				{Text: &prompt},
-			}},
+		Messages: []awsnova.Message{
+			{
+				Role: "user",
+				Content: []awsnova.Content{
+					{Text: &prompt},
+				},
+			},
+			{
+				Role: "assistant",
+				Content: []awsnova.Content{
+					{Text: &prev},
+				},
+			},
+			{
+				Role: "user",
+				Content: []awsnova.Content{
+					{Text: &fr},
+				},
+			},
 		},
 		InferenceConfig: awsnova.InferenceConfig{
-			MaxTokens: &maxTokens,
+			MaxTokens:   &maxTokens,
+			Temperature: &temperature,
 		},
 		System: "Be conscise",
 	}

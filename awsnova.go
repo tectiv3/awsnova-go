@@ -131,7 +131,6 @@ func (c *Client) InvokeAsync(ctx context.Context, req Request) <-chan *Response 
 func (c *Client) InvokeModelWithResponseStream(ctx context.Context, req Request) (<-chan *StreamResponse, error) {
 	respChan := make(chan *StreamResponse, 1)
 
-	// Setup request as before...
 	jsonBody, err := c.buildRequestBody(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
@@ -148,7 +147,6 @@ func (c *Client) InvokeModelWithResponseStream(ctx context.Context, req Request)
 
 	httpReq.Header.Set("Accept", "application/vnd.amazon.eventstream")
 
-	// Sign request as before...
 	signer, err := sigv4.New(
 		sigv4.WithCredential(c.credentials.AccessKeyID, c.credentials.SecretAccessKey, ""),
 		sigv4.WithRegionService("us-west-2", "bedrock"))
@@ -165,7 +163,6 @@ func (c *Client) InvokeModelWithResponseStream(ctx context.Context, req Request)
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
-	// Start processing stream
 	go func() {
 		defer close(respChan)
 		defer resp.Body.Close()
