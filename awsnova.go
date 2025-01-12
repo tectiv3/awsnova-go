@@ -72,15 +72,15 @@ func (c *Client) buildRequestBody(req Request) ([]byte, error) {
 	body := map[string]interface{}{
 		"schemaVersion":   "messages-v1",
 		"inferenceConfig": req.InferenceConfig,
-		"messages": []map[string]interface{}{
-			{
-				"role": "user",
-				"content": []map[string]interface{}{
-					{"text": req.Prompt},
-				},
-			},
-		},
+		"messages":        req.Messages,
 	}
+
+	if req.System != "" {
+		body["system"] = []map[string]interface{}{
+			{"text": req.System},
+		}
+	}
+
 	return json.Marshal(body)
 }
 
